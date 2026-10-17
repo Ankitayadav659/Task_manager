@@ -1,0 +1,16 @@
+{
+  "name": "office-task-manager",
+  "version": "1.0.0",
+  "description": "Office task & time management system with employee performance rating",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node --no-warnings server.js"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
