@@ -139,6 +139,14 @@ if (db.prepare('PRAGMA user_version').get().user_version < 3) {
            INSERT OR IGNORE INTO settings (key, value) VALUES ('auto_stop_time', '20:00');
            PRAGMA user_version = 3;`);
 }
+// v4: employees archive a task instead of deleting it (hidden from lists and scores; admin can see and restore it)
+if (db.prepare('PRAGMA user_version').get().user_version < 4) {
+  db.exec(`ALTER TABLE tasks ADD COLUMN archived_at TEXT;
+           ALTER TABLE tasks ADD COLUMN archived_by INTEGER;
+           PRAGMA user_version = 4;`);
+}
+// v5 and later: shared with the Firebase version
+require('./upgrades')(db);
 
 // First run: create the admin account (password must be changed at first login)
 const adminExists = db.prepare("SELECT id FROM users WHERE role = 'admin' LIMIT 1").get();

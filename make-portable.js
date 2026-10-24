@@ -13,7 +13,7 @@ const out = path.join(OUT_ROOT, NAME);
 const zip = path.join(OUT_ROOT, `${NAME}.zip`);
 
 const ITEMS = [
-  'server.js', 'db.js', 'backup.js', 'reset-password.js', 'package.json', 'package-lock.json', 'README.md',
+  'server.js', 'db.js', 'features.js', 'upgrades.js', 'backup.js', 'reset-password.js', 'package.json', 'package-lock.json', 'README.md',
   'START-TaskManager.bat', 'STOP-WorkTrack.bat', 'INSTALL-Desktop-Shortcut.bat', 'RESET-Admin-Password.bat',
   'BACKUP-Now.bat', 'SETUP-Daily-Backup.bat', 'public', 'desktop', 'employee-setup', 'node_modules',
 ];

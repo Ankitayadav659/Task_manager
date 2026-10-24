@@ -5,10 +5,12 @@ const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
 const { db, hashPassword, verifyPassword } = require('./db');
+const features = require('./features'); // history, requests, breaks (shared with the other version)
 
 const PORT = Number(process.env.PORT) || 3000;
 const SESSION_HOURS = 12;
-const LATE_GRACE_MS = 60 * 1000;            // 1 minute grace before a task counts as late
+const LATE_GRACE_MS = 60 * 1000;
+const ARCHIVE_WINDOW_MIN = 30;            // employees can archive a started/finished task this long after adding it            // 1 minute grace before a task counts as late
 const PRIORITY_WEIGHT = { urgent: 4, high: 3, medium: 2, low: 1 };
 const PRIORITIES = Object.keys(PRIORITY_WEIGHT);
 const STATUSES = ['pending', 'in_progress', 'on_hold', 'completed'];
@@ -103,6 +105,7 @@ function leaveLookup(fromDay, toDay) {
 function logEvent(taskId, userId, type, note = '') {
   db.prepare('INSERT INTO task_events (task_id, user_id, type, note, at) VALUES (?, ?, ?, ?, ?)')
     .run(taskId, userId, type, note, nowISO());
+  features.auditTaskEvent(taskId, userId, type, note); // permanent history
 }
 
 const publicUser = (u) => u && ({
@@ -130,7 +133,7 @@ function autoStopForgotten(force = false) {
   const stop = getSetting('auto_stop_time', '20:00');
   if (!/^\d{2}:\d{2}$/.test(stop)) return; // "off"
   const lastRun = db.prepare("SELECT MAX(at) AS at FROM task_events WHERE task_id = ? AND type IN ('started','resumed')");
-  for (const t of db.prepare("SELECT * FROM tasks WHERE status = 'in_progress'").all()) {
+  for (const t of db.prepare("SELECT * FROM tasks WHERE status = 'in_progress' AND archived_at IS NULL").all()) {
     const runningSince = Math.max(Date.parse(t.start_time), Date.parse(lastRun.get(t.id).at || t.start_time));
     const at = nextStopAfter(runningSince, stop);
     if (now < at) continue;
@@ -141,6 +144,7 @@ function autoStopForgotten(force = false) {
     notify(t.user_id, 'autostop', t.id, 'A task was still running — its clock was stopped',
       `${t.title} · stopped at ${label}. Please tell when you really finished it.`);
   }
+  features.closeOpenBreaks(stop);
 }
 app.use((req, res, next) => { try { autoStopForgotten(); } catch (e) { console.error('auto-stop:', e.message); } next(); });
 
@@ -148,9 +152,17 @@ app.use((req, res, next) => { try { autoStopForgotten(); } catch (e) { console.e
 function auth(req, res, next) {
   const token = parseCookies(req).tm_session;
   if (token) {
-    const row = db.prepare(`SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
+    const row = db.prepare(`SELECT u.*, s.expires_at AS session_expires_at, s.token AS session_token FROM sessions s JOIN users u ON u.id = s.user_id
                             WHERE s.token = ? AND s.expires_at > ? AND u.active = 1`).get(token, nowISO());
-    if (row) { req.user = row; return next(); }
+    if (row) {
+      req.user = row;
+      // a temporary password (set by admin) must be replaced before anything else can be used
+      const open = ['/api/me', '/api/me/password', '/api/logout'];
+      if (row.must_change_password && !open.includes(req.originalUrl.split('?')[0])) {
+        return res.status(403).json({ error: 'Please choose your own password first', must_change_password: true });
+      }
+      return next();
+    }
   }
   res.status(401).json({ error: 'Please log in' });
 }
@@ -190,7 +202,7 @@ function enrichTask(t, nowMs = Date.now()) {
   let score = null;
   const efficiency = () => (worked && planned ? Math.min(100, (planned / Math.max(worked, 0.01)) * 100) : 0);
   if (completed) {
-    if (!isLate || t.reason_status === 'accepted') score = 100;
+    if (!isLate || t.reason_status === 'accepted' || t.excused) score = 100;
     else {
       score = efficiency();
       if (t.reason_status === 'rejected') score = Math.max(0, score - 10);
@@ -210,6 +222,7 @@ function enrichTask(t, nowMs = Date.now()) {
     late_by_minutes: isLate ? Math.round((Date.parse(t.actual_end) - effExpected) / 60000)
       : overdue ? Math.round((nowMs - effExpected) / 60000) : 0,
     score: score != null ? Math.round(score) : null,
+    excused: !!t.excused,
   };
 }
 
@@ -230,7 +243,7 @@ function summarize(tasks) {
     if (t.worked_minutes) worked += t.worked_minutes;
     if (t.status === 'completed') {
       completed++;
-      if (t.is_late) late++; else onTime++;
+      if (t.is_late && !t.excused) late++; else onTime++;
     } else if (t.overdue) overdueOpen++;
     if (t.score != null) {
       const w = PRIORITY_WEIGHT[t.priority] || 2;
@@ -250,6 +263,8 @@ function summarize(tasks) {
 // ---------------------------------------------------------------- task queries
 function queryTasks(f = {}) {
   const where = [], args = [];
+  // archived tasks are left out everywhere (lists, scores, reports); only the admin's "Archived" filter shows them
+  where.push(f.status === 'archived' ? 't.archived_at IS NOT NULL' : 't.archived_at IS NULL');
   if (f.user_id) { where.push('t.user_id = ?'); args.push(Number(f.user_id)); }
   if (f.status === 'overdue') {
     where.push("t.status != 'completed' AND t.expected_end < ?"); args.push(new Date(Date.now() - LATE_GRACE_MS).toISOString());
@@ -298,6 +313,7 @@ function queryTasksById(id) {
 function ownTask(req) {
   const t = getTask(req.params.id);
   if (req.user.role !== 'admin' && t.user_id !== req.user.id) fail(403, 'This is not your task');
+  if (req.user.role !== 'admin' && t.archived_at) fail(404, 'This task was archived');
   return t;
 }
 
@@ -345,16 +361,34 @@ app.post('/api/logout', wrap((req, res) => {
   return { ok: true };
 }));
 
+// helpers given to the shared features module
+const H = { wrap, fail, adminOnly, getTask, logEvent, notify, requireText, toISO, hashPassword, LATE_GRACE_MS };
+features.registerPublic(app, H); // "Forgot password?" works without signing in
+
 app.use('/api', auth);
 
-app.get('/api/me', wrap((req) => ({ user: publicUser(req.user) })));
+app.get('/api/me', wrap((req) => ({ user: publicUser(req.user), session: { hours: SESSION_HOURS, expires_at: req.user.session_expires_at } })));
 // Admin settings (end-of-day auto-stop time)
-app.get('/api/settings', adminOnly, wrap(() => ({ auto_stop_time: getSetting('auto_stop_time', '20:00') })));
+const allSettings = () => ({ auto_stop_time: getSetting('auto_stop_time', '20:00'), work_hours_per_day: Number(getSetting('work_hours_per_day', '8')), session_hours: SESSION_HOURS });
+app.get('/api/settings', adminOnly, wrap(() => allSettings()));
 app.put('/api/settings', adminOnly, wrap((req) => {
-  const v = String((req.body || {}).auto_stop_time || '').trim();
-  if (v !== 'off' && !/^([01]\d|2[0-3]):[0-5]\d$/.test(v)) fail(400, 'Use a time like 20:00, or "off"');
-  db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run('auto_stop_time', v);
-  return { auto_stop_time: v };
+  const b = req.body || {};
+  const save = (k, v) => db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(k, String(v));
+  const before = allSettings();
+  if (b.auto_stop_time !== undefined) {
+    const v = String(b.auto_stop_time || '').trim();
+    if (v !== 'off' && !/^([01]\d|2[0-3]):[0-5]\d$/.test(v)) fail(400, 'Use a time like 20:00, or "off"');
+    save('auto_stop_time', v);
+  }
+  if (b.work_hours_per_day !== undefined) {
+    const h = Number(b.work_hours_per_day);
+    if (!(h >= 1 && h <= 16)) fail(400, 'Working hours per day must be between 1 and 16');
+    save('work_hours_per_day', Math.round(h * 2) / 2);
+  }
+  const after = allSettings();
+  const diff = Object.keys(after).filter((k) => after[k] !== before[k]).map((k) => `${k}: ${before[k]} → ${after[k]}`);
+  if (diff.length) features.audit({ actorId: req.user.id, action: 'settings_changed', entity: 'settings', details: diff.join(' ; ') });
+  return after;
 }));
 
 // Addresses employees can use to reach this server (shown to admin in "Employee PC setup")
@@ -363,12 +397,18 @@ app.get('/api/server-info', adminOnly, wrap(() => ({
     .filter((i) => i && i.family === 'IPv4' && !i.internal).map((i) => `http://${i.address}:${PORT}`)],
 })));
 
-// Only admins manage passwords; employees get theirs from the admin
-app.post('/api/me/password', adminOnly, wrap((req) => {
+// Everyone can change their own password (and must, after the admin gives a temporary one).
+// Other devices signed in with the old password are signed out.
+app.post('/api/me/password', wrap((req) => {
   const { current, next } = req.body || {};
   if (!verifyPassword(current || '', req.user.password_hash)) fail(400, 'Current password is wrong');
-  const pw = requireText(next, 'New password', 6);
+  const pw = requireText(next, 'New password', 8);
+  if (!/[A-Za-z]/.test(pw) || !/\d/.test(pw)) fail(400, 'Use at least 8 characters with letters and numbers');
+  if (pw === current) fail(400, 'The new password must be different from the current one');
   db.prepare('UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?').run(hashPassword(pw), req.user.id);
+  db.prepare('DELETE FROM sessions WHERE user_id = ? AND token != ?').run(req.user.id, req.user.session_token);
+  features.audit({ actorId: req.user.id, action: 'password_changed', entity: 'user', entityId: req.user.id, subjectUserId: req.user.id,
+    details: req.user.must_change_password ? 'Replaced the temporary password' : 'Changed own password' });
   return { ok: true };
 }));
 
@@ -387,9 +427,11 @@ app.post('/api/users', adminOnly, wrap((req) => {
   if (db.prepare('SELECT id FROM users WHERE username = ?').get(username)) fail(400, 'Username already exists');
   const role = b.role === 'admin' ? 'admin' : 'employee';
   const r = db.prepare(`INSERT INTO users (name, username, password_hash, role, department, designation, must_change_password, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, 0, ?)`)
+                        VALUES (?, ?, ?, ?, ?, ?, 1, ?)`) // the first password is temporary
     .run(name, username, hashPassword(password), role, String(b.department || '').trim(), String(b.designation || '').trim(), nowISO());
-  return publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(r.lastInsertRowid));
+  const id = Number(r.lastInsertRowid);
+  features.audit({ actorId: req.user.id, action: 'user_created', entity: 'user', entityId: id, subjectUserId: id, label: username, details: `Role: ${role}` });
+  return publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(id));
 }));
 
 app.put('/api/users/:id', adminOnly, wrap((req) => {
@@ -405,21 +447,33 @@ app.put('/api/users/:id', adminOnly, wrap((req) => {
       b.designation !== undefined ? String(b.designation).trim() : u.designation,
       role, active, u.id);
   if (!active) db.prepare('DELETE FROM sessions WHERE user_id = ?').run(u.id);
-  return publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(u.id));
+  const nu = db.prepare('SELECT * FROM users WHERE id = ?').get(u.id);
+  const diff = ['name', 'department', 'designation', 'role'].filter((k) => nu[k] !== u[k]).map((k) => `${k}: "${u[k] || ''}" → "${nu[k] || ''}"`);
+  if (diff.length) features.audit({ actorId: req.user.id, action: 'user_updated', entity: 'user', entityId: u.id, subjectUserId: u.id, label: u.username, details: diff.join(' ; ') });
+  if (nu.active !== u.active) {
+    features.audit({ actorId: req.user.id, action: nu.active ? 'user_reactivated' : 'user_deactivated', entity: 'user', entityId: u.id, subjectUserId: u.id, label: u.username,
+      details: nu.active ? 'Can sign in again' : 'Signed out and cannot sign in. Past tasks and records are kept.' });
+  }
+  return publicUser(nu);
 }));
 
 app.post('/api/users/:id/reset-password', adminOnly, wrap((req) => {
   const pw = requireText((req.body || {}).password, 'Password', 6);
-  const r = db.prepare('UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?').run(hashPassword(pw), Number(req.params.id));
+  const id = Number(req.params.id);
+  // a password given by the admin is temporary: the user chooses their own at the next sign-in
+  const r = db.prepare('UPDATE users SET password_hash = ?, must_change_password = ? WHERE id = ?').run(hashPassword(pw), id === req.user.id ? 0 : 1, id);
   if (!r.changes) fail(404, 'User not found');
-  db.prepare('DELETE FROM sessions WHERE user_id = ?').run(Number(req.params.id));
+  db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
+  db.prepare("UPDATE requests SET status = 'approved', decided_by = ?, decided_by_name = ?, decided_at = ?, decision_note = 'Temporary password set from the Employees page' WHERE kind = 'password' AND user_id = ? AND status = 'pending'")
+    .run(req.user.id, req.user.name, nowISO(), id);
+  features.audit({ actorId: req.user.id, action: 'password_reset', entity: 'user', entityId: id, subjectUserId: id, details: 'Temporary password set by admin; signed out everywhere' });
   return { ok: true };
 }));
 
 // ---------------------------------------------------------------- tasks
 app.get('/api/tasks', wrap((req) => {
   const f = { ...req.query };
-  if (req.user.role !== 'admin') f.user_id = req.user.id;
+  if (req.user.role !== 'admin') { f.user_id = req.user.id; if (f.status === 'archived') f.status = ''; }
   return queryTasks(f);
 }));
 
@@ -428,7 +482,7 @@ app.get('/api/tasks/:id', wrap((req) => {
   const events = db.prepare(`SELECT e.*, u.name AS user_name FROM task_events e LEFT JOIN users u ON u.id = e.user_id
                              WHERE e.task_id = ? ORDER BY e.at, e.id`).all(t.id);
   const children = db.prepare('SELECT id, title, status FROM tasks WHERE parent_task_id = ?').all(t.id);
-  return { ...t, events, children };
+  return { ...t, events, children, requests: features.requestsForTask(t.id) };
 }));
 
 function insertTask(fields, actorId) {
@@ -643,12 +697,41 @@ app.post('/api/tasks/:id/review', adminOnly, wrap((req) => {
   return getTask(t.id);
 }));
 
-app.delete('/api/tasks/:id', wrap((req) => {
+// Employees never delete: a task added by mistake is archived (kept, but hidden from lists and scores).
+// Own task, not assigned by admin: a planned task any time; a started/finished one only within
+// 30 minutes of adding it - so finished work cannot be hidden later.
+app.post('/api/tasks/:id/archive', wrap((req) => {
   const t = ownTask(req);
+  if (t.archived_at) fail(400, 'This task is already archived');
   if (req.user.role !== 'admin') {
-    if (t.status !== 'pending') fail(400, 'Only planned (not started) tasks can be deleted');
-    if (t.assigned_by) fail(400, 'Tasks assigned by admin cannot be deleted');
+    if (t.assigned_by) fail(400, 'Tasks assigned by admin cannot be archived');
+    const recent = Date.now() - Date.parse(t.created_at) < ARCHIVE_WINDOW_MIN * 60000;
+    if (t.status !== 'pending' && !recent) fail(400, `Started or finished tasks can only be archived within ${ARCHIVE_WINDOW_MIN} minutes of adding them`);
   }
+  const reason = String((req.body || {}).reason || '').trim().slice(0, 300) || 'Added by mistake';
+  const ts = nowISO();
+  // a running task is put on hold first, so no time keeps counting while it is archived
+  if (t.status === 'in_progress') db.prepare("UPDATE tasks SET status='on_hold', paused_at=?, hold_reason=? WHERE id=?").run(ts, 'Archived', t.id);
+  db.prepare('UPDATE tasks SET archived_at=?, archived_by=?, updated_at=? WHERE id=?').run(ts, req.user.id, ts, t.id);
+  logEvent(t.id, req.user.id, 'archived', `Archived. Reason: ${reason}`);
+  return { ok: true };
+}));
+
+app.post('/api/tasks/:id/restore', adminOnly, wrap((req) => {
+  const t = getTask(req.params.id);
+  if (!t.archived_at) fail(400, 'This task is not archived');
+  const ts = nowISO();
+  db.prepare('UPDATE tasks SET archived_at=NULL, archived_by=NULL, updated_at=? WHERE id=?').run(ts, t.id);
+  logEvent(t.id, req.user.id, 'restored', 'Restored from archive');
+  return getTask(t.id);
+}));
+
+// Permanent delete: admin only
+app.delete('/api/tasks/:id', adminOnly, wrap((req) => {
+  const t = getTask(req.params.id);
+  // the task and its timeline are removed, but the history keeps a copy of what was deleted
+  features.audit({ actorId: req.user.id, action: 'deleted', entity: 'task', entityId: t.id, subjectUserId: t.user_id, label: t.title,
+    details: `Permanently deleted. Status: ${t.status}; start: ${t.start_time || '-'}; expected end: ${t.expected_end}; actual end: ${t.actual_end || '-'}; worked: ${t.worked_minutes ?? '-'} min` });
   db.prepare('DELETE FROM tasks WHERE id = ?').run(t.id);
   return { ok: true };
 }));
@@ -688,7 +771,7 @@ app.get('/api/comments/unread', wrap((req) => {
                      JOIN tasks t ON t.id = c.task_id
                      JOIN users ou ON ou.id = t.user_id
                      LEFT JOIN comment_reads r ON r.task_id = t.id AND r.user_id = ?
-                     WHERE (c.user_id IS NULL OR c.user_id != ?) AND (r.last_read_at IS NULL OR c.created_at > r.last_read_at)
+                     WHERE (c.user_id IS NULL OR c.user_id != ?) AND (r.last_read_at IS NULL OR c.created_at > r.last_read_at) AND t.archived_at IS NULL
                        ${isAdmin ? '' : 'AND t.user_id = ?'}
                      GROUP BY t.id ORDER BY last_at DESC LIMIT 50`)
     .all(...(isAdmin ? [req.user.id, req.user.id] : [req.user.id, req.user.id, req.user.id]));
@@ -750,12 +833,15 @@ app.post('/api/leaves', adminOnly, wrap((req) => {
     }
     db.exec('COMMIT');
   } catch (e) { db.exec('ROLLBACK'); throw e; }
+  features.audit({ actorId: req.user.id, action: 'leave_added', entity: 'leave', subjectUserId: userId, label: type, details: `${days[0] || from} → ${days[days.length - 1] || to} (${days.length} day(s))${note ? ': ' + note : ''}` });
   return { added: days.length };
 }));
 
 app.delete('/api/leaves/:id', adminOnly, wrap((req) => {
+  const l = db.prepare('SELECT * FROM leaves WHERE id = ?').get(Number(req.params.id));
   const r = db.prepare('DELETE FROM leaves WHERE id = ?').run(Number(req.params.id));
   if (!r.changes) fail(404, 'Entry not found');
+  features.audit({ actorId: req.user.id, action: 'leave_removed', entity: 'leave', entityId: l.id, subjectUserId: l.user_id, label: l.type, details: `${l.day}${l.note ? ': ' + l.note : ''}` });
   return { ok: true };
 }));
 
@@ -790,7 +876,7 @@ function dayReport(users, from, to, now = Date.now()) {
                            FROM tasks t JOIN users u ON u.id = t.user_id
                            LEFT JOIN users a ON a.id = t.assigned_by
                            LEFT JOIN tasks p ON p.id = t.parent_task_id
-                           WHERE t.user_id = ? AND (
+                           WHERE t.user_id = ? AND t.archived_at IS NULL AND (
                              (t.start_time IS NOT NULL AND t.status != 'pending' AND t.start_time < ?
                                AND (t.status != 'completed' OR t.actual_end >= ?))
                              OR (t.status = 'pending' AND t.expected_end >= ? AND t.expected_end < ?))
@@ -802,7 +888,10 @@ function dayReport(users, from, to, now = Date.now()) {
     const longest = tasks.reduce((m, t) => ((t.worked_minutes || 0) > (m?.worked_minutes || 0) ? t : m), null);
     const sum = summarize(tasks);
     if (FULL_OFF(leave) && sum.score == null) Object.assign(sum, { grade: leave.type === 'holiday' ? 'Holiday' : 'On leave', stars: 0 });
-    return { user: publicUser(u), ...sum, leave: leave ? { type: leave.type, note: leave.note } : null, longest_task_id: longest ? longest.id : null, tasks };
+    const workHours = Number(getSetting('work_hours_per_day', '8')) || 8;
+    return { user: publicUser(u), ...sum, leave: leave ? { type: leave.type, note: leave.note } : null, longest_task_id: longest ? longest.id : null, tasks,
+      break_minutes: features.breakMinutes(u.id, from, to), work_hours: workHours,
+      overtime_minutes: Math.max(0, Math.round(sum.worked_minutes - workHours * 60)) };
   });
 }
 const activeEmployees = () => db.prepare("SELECT * FROM users WHERE role = 'employee' AND active = 1 ORDER BY name").all();
@@ -844,8 +933,8 @@ app.get('/api/stats/dashboard', adminOnly, wrap((req) => {
   const open = queryTasks({ status: 'active' });
   const overdue = queryTasks({ status: 'overdue' });
   const todayTasks = queryTasks({ from });
-  const completedToday = db.prepare("SELECT COUNT(*) AS c FROM tasks WHERE status='completed' AND actual_end >= ?").get(today.toISOString()).c;
-  const pendingReviews = db.prepare("SELECT COUNT(*) AS c FROM tasks WHERE reason_status='pending'").get().c;
+  const completedToday = db.prepare("SELECT COUNT(*) AS c FROM tasks WHERE status='completed' AND actual_end >= ? AND archived_at IS NULL").get(today.toISOString()).c;
+  const pendingReviews = db.prepare("SELECT COUNT(*) AS c FROM tasks WHERE reason_status='pending' AND archived_at IS NULL").get().c;
 
   const todayKey = ymd(today);
   const lk = leaveLookup(todayKey, todayKey);
@@ -864,6 +953,7 @@ app.get('/api/stats/dashboard', adminOnly, wrap((req) => {
 
   const activity = db.prepare(`SELECT e.*, u.name AS user_name, t.title AS task_title FROM task_events e
                                LEFT JOIN users u ON u.id = e.user_id JOIN tasks t ON t.id = e.task_id
+                               WHERE t.archived_at IS NULL OR e.type = 'archived'
                                ORDER BY e.at DESC, e.id DESC LIMIT 20`).all();
 
   return {
@@ -881,6 +971,157 @@ app.get('/api/stats/dashboard', adminOnly, wrap((req) => {
     live, overdue: overdue.slice(0, 15), activity,
   };
 }));
+
+// ---------------------------------------------------------------- task assistant (built-in, no internet needed)
+// Looks at the tasks and gives: a short summary, the main reasons for delays, and the next actions to take.
+const REASON_GROUPS = [
+  ['Waiting for information / approval', /wait|approv|pending from|data from|reply|response|confirm|document/i],
+  ['Client / customer', /client|customer|party|vendor|buyer|trader/i],
+  ['Urgent work came in', /urgent|boss|admin|priority|switched to|new work/i],
+  ['Changes / rework', /change|correction|rework|revis|redo|mistake|extra|scope|again/i],
+  ['Meeting / call', /meeting|call|discussion/i],
+  ['System / internet issue', /system|internet|server|network|software|computer|\bpc\b|power|electric|bug|down|slow/i],
+  ['Break / personal', /lunch|break|personal|tea|leave|sick/i],
+];
+const reasonGroup = (text) => (REASON_GROUPS.find(([, re]) => re.test(text || '')) || ['Other'])[0];
+
+function groupCount(items) {
+  const m = new Map();
+  for (const x of items) m.set(x, (m.get(x) || 0) + 1);
+  return [...m.entries()].sort((a, b) => b[1] - a[1]).map(([label, count]) => ({ label, count, pct: Math.round((count / items.length) * 100) }));
+}
+
+// delay reasons + how accurate the planning is, for a set of finished tasks
+function delayInsights(done, holdNotes) {
+  const late = done.filter((t) => t.is_late);
+  const planned = done.filter((t) => t.planned_minutes && t.worked_minutes != null);
+  const ratio = planned.length ? planned.reduce((s, t) => s + t.worked_minutes, 0) / Math.max(1, planned.reduce((s, t) => s + t.planned_minutes, 0)) : null;
+  return {
+    finished: done.length,
+    late: late.length,
+    late_pct: done.length ? Math.round((late.length / done.length) * 100) : 0,
+    reasons: groupCount(late.map((t) => reasonGroup(t.delay_reason))),
+    interruptions: groupCount(holdNotes.map(reasonGroup)).slice(0, 4),
+    time_used_pct: ratio == null ? null : Math.round(ratio * 100), // 120 = tasks take 20% longer than planned
+  };
+}
+
+function planningTip(ins) {
+  if (ins.time_used_pct == null || ins.finished < 3) return null;
+  if (ins.time_used_pct >= 115) return `Tasks take about ${ins.time_used_pct - 100}% longer than planned. Add a little extra time when you plan.`;
+  if (ins.time_used_pct <= 80) return `Tasks finish about ${100 - ins.time_used_pct}% faster than planned. You can plan shorter times.`;
+  return 'Planned times match the real times well. Keep planning the same way.';
+}
+
+const holdNotesFor = (userIds, sinceIso) => {
+  if (!userIds.length) return [];
+  return db.prepare(`SELECT e.note FROM task_events e JOIN tasks t ON t.id = e.task_id
+                     WHERE e.type = 'paused' AND e.at >= ? AND t.archived_at IS NULL AND t.user_id IN (${userIds.map(() => '?').join(',')})`)
+    .all(sinceIso, ...userIds)
+    .map((r) => String(r.note || '').replace(/^On hold\. Reason:\s*/i, '').split('|')[0].trim())
+    .filter((n) => n && !/^Auto-stopped/i.test(n));
+};
+
+function employeeAssistant(user) {
+  const now = Date.now();
+  const d0 = new Date(); d0.setHours(0, 0, 0, 0);
+  const d1 = new Date(d0); d1.setDate(d1.getDate() + 1);
+  const d2 = new Date(d1); d2.setDate(d2.getDate() + 1);
+  const since = new Date(now - 30 * 86400000).toISOString();
+  const all = queryTasks({ user_id: user.id });
+  const pending = all.filter((t) => t.status === 'pending');
+  const running = all.filter((t) => t.status === 'in_progress');
+  const paused = all.filter((t) => t.status === 'on_hold');
+  const todayPending = pending.filter((t) => Date.parse(t.start_time) >= d0 && Date.parse(t.start_time) < d1);
+  const tomorrow = pending.filter((t) => Date.parse(t.start_time) >= d1 && Date.parse(t.start_time) < d2);
+  const missed = pending.filter((t) => t.overdue);
+  const left = todayPending.filter((t) => !t.overdue);
+  const leftMin = left.reduce((s, t) => s + (t.planned_minutes || 0), 0);
+  const done30 = queryTasks({ user_id: user.id, status: 'completed', from: since });
+  const ins = delayInsights(done30, holdNotesFor([user.id], since));
+  const unread = db.prepare(`SELECT COUNT(DISTINCT c.task_id) AS n FROM task_comments c JOIN tasks t ON t.id = c.task_id
+                             LEFT JOIN comment_reads r ON r.task_id = t.id AND r.user_id = ?
+                             WHERE t.user_id = ? AND t.archived_at IS NULL AND c.user_id != ? AND (r.last_read_at IS NULL OR c.created_at > r.last_read_at)`).get(user.id, user.id, user.id).n;
+
+  const actions = [];
+  const add = (a) => actions.push(a);
+  for (const t of running.filter((x) => x.overdue)) add({ icon: '⏰', text: `“${t.title}” is ${t.late_by_minutes} min over its planned time. Finish it, or pause it if something else came up.`, task_id: t.id, buttons: ['complete', 'pause'] });
+  for (const t of paused.filter((x) => x.auto_paused)) add({ icon: '🌙', text: `“${t.title}” was left running. Confirm when you finished it.`, task_id: t.id, buttons: ['complete', 'resume'] });
+  for (const t of missed.slice(0, 3)) add({ icon: '⚠️', text: `“${t.title}” was planned for ${new Date(t.start_time).toLocaleTimeString('en-IN', { hour: 'numeric', minute: '2-digit', hour12: true })} and has not started. Start it now or move it.`, task_id: t.id, buttons: ['qstart', 'move'] });
+  for (const t of all.filter((x) => x.status === 'completed' && x.is_late && x.reason_status === 'rejected').slice(0, 2)) add({ icon: '📝', text: `Your admin returned the delay reason for “${t.title}”. Update the reason.`, task_id: t.id, buttons: ['reason'] });
+  if (unread) add({ icon: '💬', text: `You have unread messages from your admin on ${unread} task${unread > 1 ? 's' : ''}.`, buttons: ['messages'] });
+  for (const t of paused.filter((x) => !x.auto_paused).slice(0, 2)) if (!running.length) add({ icon: '⏸', text: `“${t.title}” is paused. Resume it when you are ready.`, task_id: t.id, buttons: ['resume'] });
+  // the best next task: urgent/high first, then the earliest start
+  const prio = { urgent: 0, high: 1, medium: 2, low: 3 };
+  const next = [...left].sort((a, b) => (prio[a.priority] - prio[b.priority]) || (Date.parse(a.start_time) - Date.parse(b.start_time)))[0];
+  if (next && !running.length) add({ icon: '▶', text: `Next: start “${next.title}”${next.priority === 'urgent' || next.priority === 'high' ? ` (${next.priority} priority)` : ''}, planned for ${new Date(next.start_time).toLocaleTimeString('en-IN', { hour: 'numeric', minute: '2-digit', hour12: true })}.`, task_id: next.id, buttons: ['qstart'] });
+  if (!todayPending.length && !running.length && new Date().getHours() < 17) add({ icon: '📋', text: 'Nothing planned for the rest of today. Add your next task on the Today page.', buttons: ['today'] });
+  if (new Date().getHours() >= 16 && !tomorrow.length) add({ icon: '🗓️', text: 'Nothing is planned for tomorrow yet. Plan tomorrow in the Calendar.', buttons: ['calendar'] });
+
+  const parts = [];
+  parts.push(running.length ? `You are working on “${running[0].title}”.` : 'No task is running right now.');
+  parts.push(left.length ? `${left.length} task${left.length > 1 ? 's' : ''} left for today (${Math.round(leftMin / 6) / 10} h planned).` : 'No more tasks planned for today.');
+  if (missed.length) parts.push(`${missed.length} planned task${missed.length > 1 ? 's were' : ' was'} missed.`);
+  if (paused.length) parts.push(`${paused.length} paused.`);
+  if (tomorrow.length) parts.push(`${tomorrow.length} planned for tomorrow.`);
+  return {
+    for: 'employee', summary: parts.join(' '),
+    counts: { running: running.length, paused: paused.length, today_left: left.length, missed: missed.length, tomorrow: tomorrow.length },
+    actions: actions.slice(0, 6),
+    insights: { ...ins, tip: planningTip(ins), period: 'last 30 days' },
+  };
+}
+
+function adminAssistant() {
+  const now = Date.now();
+  const since = new Date(now - 30 * 86400000).toISOString();
+  const emps = activeEmployees();
+  const open = queryTasks({ status: 'active' });
+  const overdue = queryTasks({ status: 'overdue' });
+  const d0 = new Date(); d0.setHours(0, 0, 0, 0);
+  const d1 = new Date(d0); d1.setDate(d1.getDate() + 1);
+  const pendingToday = queryTasks({ status: 'pending', from: d0.toISOString(), to: d1.toISOString() });
+  const reviews = db.prepare("SELECT COUNT(*) AS n FROM tasks WHERE reason_status = 'pending' AND archived_at IS NULL").get().n;
+  const done30 = queryTasks({ status: 'completed', from: since });
+  const ins = delayInsights(done30, holdNotesFor(emps.map((u) => u.id), since));
+  const todayKey = ymd(d0);
+  const lk = leaveLookup(todayKey, todayKey);
+
+  const people = emps.map((u) => {
+    const mine = open.filter((t) => t.user_id === u.id);
+    const od = overdue.filter((t) => t.user_id === u.id);
+    const fin = done30.filter((t) => t.user_id === u.id);
+    return {
+      id: u.id, name: u.name, on_leave: FULL_OFF(lk(u.id, todayKey)),
+      running: mine.filter((t) => t.status === 'in_progress').length,
+      overdue: od.length, planned_today: pendingToday.filter((t) => t.user_id === u.id).length,
+      late_pct: fin.length ? Math.round((fin.filter((t) => t.is_late).length / fin.length) * 100) : null, finished: fin.length,
+      top_reason: groupCount(fin.filter((t) => t.is_late).map((t) => reasonGroup(t.delay_reason)))[0]?.label || null,
+    };
+  });
+
+  const actions = [];
+  if (reviews) actions.push({ icon: '📝', text: `${reviews} delay reason${reviews > 1 ? 's are' : ' is'} waiting for your review.`, buttons: ['reviews'] });
+  for (const p of people.filter((x) => x.overdue).sort((a, b) => b.overdue - a.overdue).slice(0, 3)) actions.push({ icon: '⚠️', text: `Follow up with ${p.name}: ${p.overdue} overdue task${p.overdue > 1 ? 's' : ''}.`, user_id: p.id, buttons: ['employee'] });
+  const idle = people.filter((p) => !p.on_leave && !p.running && new Date().getHours() >= 10 && new Date().getHours() < 18);
+  if (idle.length) actions.push({ icon: '💤', text: `${idle.map((p) => p.name.split(' ')[0]).join(', ')} ${idle.length > 1 ? 'have' : 'has'} no task running right now.`, buttons: ['overview'] });
+  const noPlan = people.filter((p) => !p.on_leave && !p.planned_today && !p.running);
+  if (noPlan.length && new Date().getHours() < 15) actions.push({ icon: '📋', text: `No tasks planned today for ${noPlan.map((p) => p.name.split(' ')[0]).join(', ')}. You can assign work.`, buttons: ['assign'] });
+  const worst = people.filter((p) => p.finished >= 3 && p.late_pct >= 40).sort((a, b) => b.late_pct - a.late_pct)[0];
+  if (worst) actions.push({ icon: '📉', text: `${worst.name} finished ${worst.late_pct}% of tasks late in the last 30 days${worst.top_reason ? ` — mostly “${worst.top_reason}”` : ''}. Worth a quick talk.`, user_id: worst.id, buttons: ['employee'] });
+  if (ins.reasons[0] && ins.late >= 3) actions.push({ icon: '🔎', text: `Most delays are due to “${ins.reasons[0].label}” (${ins.reasons[0].pct}% of late tasks). Fixing this would help the whole team.`, buttons: [] });
+
+  const running = people.reduce((s, p) => s + p.running, 0);
+  const summary = [
+    `${running} of ${emps.length} employee${emps.length !== 1 ? 's are' : ' is'} working right now.`,
+    `${overdue.length} task${overdue.length !== 1 ? 's are' : ' is'} overdue.`,
+    `${pendingToday.length} task${pendingToday.length !== 1 ? 's' : ''} still planned for today.`,
+    reviews ? `${reviews} delay reason${reviews > 1 ? 's' : ''} to review.` : '',
+  ].filter(Boolean).join(' ');
+  return { for: 'admin', summary, actions: actions.slice(0, 7), people, insights: { ...ins, tip: planningTip(ins), period: 'last 30 days' } };
+}
+
+app.get('/api/assistant', wrap((req) => (req.user.role === 'admin' ? adminAssistant() : employeeAssistant(req.user))));
 
 // ---------------------------------------------------------------- CSV export
 app.get('/api/export/tasks.csv', adminOnly, (req, res) => {
@@ -908,6 +1149,7 @@ app.get('/api/export/tasks.csv', adminOnly, (req, res) => {
   res.send('﻿' + csv);
 });
 
+features.register(app, H); // history, requests, breaks, sign out everywhere
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
 
 // ---------------------------------------------------------------- employee PC setup (desktop icon)

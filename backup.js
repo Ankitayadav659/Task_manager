@@ -17,7 +17,7 @@ const KEEP = 30;
 
 // Files and folders that make up the app (node_modules is re-installed on restore, logs are not needed)
 const ITEMS = [
-  'server.js', 'db.js', 'backup.js', 'reset-password.js', 'package.json', 'package-lock.json', 'README.md',
+  'server.js', 'db.js', 'features.js', 'upgrades.js', 'backup.js', 'reset-password.js', 'package.json', 'package-lock.json', 'README.md',
   'START-TaskManager.bat', 'STOP-WorkTrack.bat', 'INSTALL-Desktop-Shortcut.bat', 'RESET-Admin-Password.bat', 'BACKUP-Now.bat', 'SETUP-Daily-Backup.bat',
   'public', 'desktop', 'employee-setup', 'make-portable.js', 'MAKE-Portable-Zip.bat',
 ];
@@ -63,7 +63,7 @@ fs.writeFileSync(path.join(out, 'RESTORE-GUIDE.txt'), [
   '',
   'WHAT IS INSIDE',
   '  app\\public\\            -> frontend (screens, design, icons)',
-  '  app\\server.js, db.js   -> backend (rules, ratings, security, database)',
+  '  app\\server.js, db.js, features.js, upgrades.js -> backend (rules, ratings, security, database, history, requests)',
   '  app\\data\\taskmanager.db -> ALL your data: employees, tasks, comments, leave, ratings',
   '  app\\*.bat              -> start / stop / install / reset password / backup tools',
   '',
